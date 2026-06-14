@@ -6,17 +6,18 @@ This project contains a Python evaluation script (`evaluate_speed.py`) designed 
 The script calculates standard regression metrics (MAE, MAPE, RMSE) to quantify the model's performance and generates a comparative visual plot.
 
 ## Directory Structure
+
 To run the evaluation script successfully, ensure your project directory is structured as follows:
 
+```text
 your_project_folder/
-│
 ├── evaluate_yolo_speed.py       # The main evaluation script
-│
 └── vehicle_speeds/              # Subfolder containing the YOLOv8 output files
     ├── vehicle_speeds_1.csv
     ├── vehicle_speeds_2.csv
     ├── ...
     └── vehicle_speeds_12.csv
+```
 
 
 ## Prerequisites
