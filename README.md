@@ -1,4 +1,4 @@
-# AI Traffic Monitor & Speed Estimation System
+# Traffic Monitor & Speed Estimation System
 
 This repository contains an end-to-end computer vision pipeline that performs vehicle detection, tracking, real-world speed estimation, and traffic density analysis using a monocular traffic video camera feed. 
 
