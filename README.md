@@ -18,17 +18,6 @@ A real-time traffic analysis tool that uses YOLOv8 and computer vision to detect
 
 ---
 
-## Differences from the Interactive Version
-
-| Feature | Interactive Version | This Version |
-|---|---|---|
-| Lane definition | Drawn live via mouse GUI | Hard-coded `LANE_POLYGONS` array |
-| Startup step | Interactive window on first frame | None — runs immediately |
-| Best for | Exploratory use, new camera setups | Fixed installations, batch pipelines |
-| `define_lanes_interactively()` | Present | Removed |
-
----
-
 ## Features
 
 - **Vehicle Detection & Tracking** — Detects cars, motorcycles, buses, and trucks using YOLOv8, tracked across frames with ByteTrack.
