@@ -1,6 +1,6 @@
 # Traffic Surveillance & Risk Monitoring System
 
-A real-time traffic analysis tool that uses YOLOv8 and computer vision to detect vehicles, estimate speeds, flag lane crossings, compute traffic risk scores, and **adaptively control traffic signal timings** — all from video footage.
+A real-time traffic analysis tool that uses YOLOv8 and computer vision to detect vehicles, estimate speeds, flag lane crossings, compute traffic risk scores, predict future traffic density and risk, and adaptively control traffic signal timings — all from video footage.
 
 > **Tip — Run on Google Colab with a T4 GPU**
 > Processing traffic video with `yolov8x.pt` at 1280px resolution is compute-intensive. If you don't have a local GPU, **Google Colab's free T4 GPU** is an excellent option that can be 10–20× faster than CPU.
@@ -14,7 +14,6 @@ A real-time traffic analysis tool that uses YOLOv8 and computer vision to detect
 > !pip install ultralytics supervision opencv-python-headless numpy pandas matplotlib tqdm
 > !python traffic_monitor.py
 > ```
-> Note: use `opencv-python-headless` on Colab since there is no display; the script's `plt.show()` calls can be replaced with `plt.savefig(...)` for plot export.
 
 ---
 
@@ -25,10 +24,13 @@ A real-time traffic analysis tool that uses YOLOv8 and computer vision to detect
 - **Overspeed Detection** — Flags and highlights vehicles exceeding a configurable speed limit.
 - **Lane Crossing Detection** — Detects illegal lane changes using pre-defined polygon boundaries; logs events and displays on-screen alerts.
 - **Traffic Risk Scoring** — Calculates a composite risk score per frame based on vehicle count, speed variance, and congestion level.
+- **Risk Trend Analysis** — Classifies whether the traffic risk is **Increasing**, **Decreasing**, or **Stable** by fitting a linear trend to the recent risk score history.
+- **Traffic Density Prediction** — Forecasts the number of vehicles expected on the road `N` seconds into the future using linear regression over a rolling history window, and pre-classifies predicted congestion level.
+- **Predicted Risk Score** — Projects the traffic risk score `N` seconds ahead using the same linear regression approach applied to the rolling risk score history.
 - **Congestion Monitoring** — Classifies traffic density as Low, Medium, or High and triggers on-screen warning banners.
 - **Adaptive Signal Control** — Dynamically adjusts per-lane green signal durations based on real-time vehicle density, speed variance, and congestion level. Includes emergency override to force green for critically congested lanes.
-- **Annotated Video Output** — Produces an output video with bounding boxes, speed labels, trace trails, HUD stats, adaptive signal status, and warning banners.
-- **CSV Data Export** — Writes per-frame and per-vehicle summary CSVs for downstream analysis.
+- **Annotated Video Output** — Produces an output video with bounding boxes, speed labels, trace trails, HUD stats (including live predictions and risk trend), adaptive signal status, and warning banners.
+- **CSV Data Export** — Writes per-frame, per-vehicle summary, and per-frame metrics CSVs (including predicted density and predicted risk) for downstream analysis.
 - **Post-run Plots** — Generates matplotlib charts of overspeed events, lane crossings, and risk scores over time.
 
 ---
@@ -37,12 +39,13 @@ A real-time traffic analysis tool that uses YOLOv8 and computer vision to detect
 
 ```
 .
-├── traffic_monitor.py            # Main script
-├── adaptive_signal.py            # Adaptive signal controller module
+├── traffic_monitor.py              # Main script
+├── adaptive_signal.py              # Adaptive signal controller module
 ├── traffic_surveillance_video.mp4  # Input video (user-supplied)
-├── output.mp4                    # Annotated output video (generated)
-├── vehicle_speeds.csv            # Per-frame data (generated)
-└── vehicle_speed_summary.csv     # Per-vehicle summary (generated)
+├── output.mp4                      # Annotated output video (generated)
+├── vehicle_speeds.csv              # Per-frame vehicle data (generated)
+├── vehicle_speed_summary.csv       # Per-vehicle summary (generated)
+└── frame_metrics.csv               # Per-frame aggregate metrics with predictions (generated)
 ```
 
 ---
@@ -62,7 +65,7 @@ pip install ultralytics supervision opencv-python numpy pandas matplotlib tqdm
 | `ultralytics` | YOLOv8 model inference |
 | `supervision` | Tracking, annotation, video I/O |
 | `opencv-python` | Frame processing, perspective transform |
-| `numpy` | Array math |
+| `numpy` | Array math and linear regression (`np.polyfit`) |
 | `pandas` | CSV loading for plot generation |
 | `matplotlib` | Post-run metric charts |
 | `tqdm` | Progress bar |
@@ -139,8 +142,9 @@ All tunable parameters are at the top of `traffic_monitor.py`:
 |---|---|---|
 | `SOURCE_VIDEO_PATH` | `traffic_surveillance_video.mp4` | Input video path |
 | `TARGET_VIDEO_PATH` | `output.mp4` | Annotated output video path |
-| `CSV_PER_FRAME` | `vehicle_speeds.csv` | Per-frame data export |
+| `CSV_PER_FRAME` | `vehicle_speeds.csv` | Per-frame vehicle data export |
 | `CSV_SUMMARY` | `vehicle_speed_summary.csv` | Per-vehicle summary export |
+| `CSV_FRAME_METRICS` | `frame_metrics.csv` | Per-frame aggregate metrics export (includes predictions) |
 | `CONFIDENCE_THRESHOLD` | `0.3` | Minimum YOLO detection confidence |
 | `IOU_THRESHOLD` | `0.5` | NMS IoU threshold |
 | `MODEL_NAME` | `yolov8x.pt` | YOLO model weights |
@@ -149,6 +153,8 @@ All tunable parameters are at the top of `traffic_monitor.py`:
 | `HIGH_DENSITY_THRESHOLD` | `10` | Vehicle count to trigger high-density alert |
 | `CONGESTION_THRESHOLDS` | `low: 5, medium: 10` | Vehicle count thresholds for congestion levels |
 | `RISK_WEIGHTS` | `α=1.2, β=0.4, γ=3.0` | Weights for risk score formula |
+| `HISTORY_WINDOW_SEC` | `10` | Rolling window (seconds) of history used for predictions |
+| `PREDICTION_HORIZON_SEC` | `5` | How far ahead (seconds) to project density and risk |
 | `LANE_POLYGONS` | 6 pre-set polygons | Lane boundary definitions (pixel coordinates) |
 
 ### `adaptive_signal.py`
@@ -167,6 +173,49 @@ Signal timing parameters are tunable at the top of `adaptive_signal.py`:
 | `CONGESTION_BONUS` | `low: 0, medium: 8, high: 20` | Flat green-time bonus (seconds) by congestion level |
 | `LOW_DENSITY_THRESH` | `3` | Vehicle count below which no density bonus is applied |
 | `MEDIUM_DENSITY_THRESH` | `7` | Vehicle count threshold separating medium from high density |
+
+---
+
+## Traffic Prediction & Risk Trend
+
+### Overview
+
+Every frame, the system maintains two rolling history buffers (each capped at `HISTORY_WINDOW_SEC` × fps samples):
+
+- `global_density_history` — vehicle count per frame
+- `global_risk_history` — risk score per frame
+
+Once at least 3 seconds of data has accumulated in a buffer, the system fits a **first-degree polynomial (linear regression)** using NumPy's `np.polyfit` and extrapolates `PREDICTION_HORIZON_SEC` seconds into the future.
+
+### Traffic Density Prediction
+
+```
+predicted_density = m × future_frame + c
+```
+
+Where `m` and `c` are the slope and intercept of the linear fit over the recent density history, and `future_frame` is the frame index at `PREDICTION_HORIZON_SEC` seconds ahead. The result is clamped to `≥ 0` to prevent negative vehicle counts.
+
+The predicted density is then classified into a **predicted congestion level** (Low / Medium / High) using the same `CONGESTION_THRESHOLDS` as the live reading.
+
+### Predicted Risk Score
+
+```
+predicted_risk = m_risk × future_frame + c_risk
+```
+
+The same linear regression approach is applied to `global_risk_history` to project the risk score `PREDICTION_HORIZON_SEC` seconds ahead.
+
+### Risk Trend
+
+The risk trend is derived by comparing the predicted risk score to the current risk score:
+
+| Condition | Trend label |
+|---|---|
+| `predicted_risk > current_risk + 1.0` | `Increasing` |
+| `predicted_risk < current_risk − 1.0` | `Decreasing` |
+| Otherwise | `Stable` |
+
+All three values (predicted density, predicted congestion, predicted risk, and risk trend) are displayed live in the HUD and exported to `frame_metrics.csv`.
 
 ---
 
@@ -230,6 +279,9 @@ Each tracked vehicle is annotated with:
 Lane boundaries are drawn as white outlines labelled L1–L6. The HUD in the top-left corner shows:
 - Live and total vehicle counts
 - Congestion level and risk score
+- Risk trend (`Increasing` / `Stable` / `Decreasing`)
+- Predicted vehicle density `+5s` ahead and predicted congestion level
+- Predicted risk score `+5s` ahead
 - Overspeed and lane-crossing counts
 - **Adaptive signal status panel** — per-lane phase, countdown, and adjustment reason
 
@@ -247,6 +299,22 @@ Full-width warning banners appear at the bottom for active high-density, overspe
 | `overspeed_flag` | 1 if exceeding speed limit |
 | `lane_crossing_flag` | 1 if crossing a lane boundary |
 | `risk_score` | Composite risk score for the frame |
+
+### Per-frame Metrics CSV (`frame_metrics.csv`)
+
+Aggregate frame-level data including predictions — one row per frame:
+
+| Column | Description |
+|---|---|
+| `frame` | Frame index |
+| `timestamp_sec` | Time in seconds |
+| `live_vehicles` | Active vehicle count in the frame |
+| `pred_vehicles_5s` | Predicted vehicle count 5 seconds ahead |
+| `overspeeding_vehicles` | Number of vehicles exceeding the speed limit |
+| `lane_crossings` | Number of active lane-crossing events |
+| `speed_variation` | Speed standard deviation across all vehicles (km/h) |
+| `risk_score` | Current composite risk score |
+| `pred_risk_score_5s` | Predicted risk score 5 seconds ahead |
 
 ### Per-vehicle Summary CSV (`vehicle_speed_summary.csv`)
 
@@ -278,4 +346,6 @@ Where congestion level is 1 (Low), 2 (Medium), or 3 (High), and the default weig
 - The script detects COCO classes 2 (car), 3 (motorcycle), 5 (bus), and 7 (truck). Other vehicle types are ignored.
 - On headless servers (no display), replace `plt.show()` with `plt.savefig("traffic_plots.png")` to save charts to disk instead.
 - `adaptive_signal.py` must be in the same directory as `traffic_monitor.py`, as it is imported as a module.
+- Predictions require at least 3 seconds of accumulated history before they activate. Before that threshold, predicted values fall back to the current frame's readings.
+- The prediction model uses **linear regression only** — it extrapolates a short-term trend and works best over the configured `PREDICTION_HORIZON_SEC` window. It is not a substitute for long-range forecasting.
 - The adaptive signal controller has no effect on actual physical hardware — it is a simulation layer that annotates the video output. To use it with real signals, integrate `AdaptiveSignalController` with your signal hardware API and call `force_green()` as needed.

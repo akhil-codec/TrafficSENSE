@@ -1,3 +1,4 @@
+
 import cv2
 import time
 from dataclasses import dataclass, field
@@ -162,16 +163,7 @@ class AdaptiveSignalController:
     
 
     def _compute_green(self, stats: LaneStats, state: LaneSignalState) -> float:
-        """
-        Adaptive green time formula:
 
-            green = BASE
-                  + DENSITY_WEIGHT  * max(0, density - LOW_DENSITY_THRESH)
-                  + SPEED_VAR_WEIGHT * speed_std
-                  + CONGESTION_BONUS[level]
-
-        Clamped to [MIN_GREEN_SEC, MAX_GREEN_SEC].
-        """
         base = BASE_GREEN_SEC
         reasons = []
 

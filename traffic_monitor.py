@@ -16,11 +16,11 @@ from adaptive_signal import (
 )  
 
 
-
 SOURCE_VIDEO_PATH = "traffic_surveillance_video.mp4"
 TARGET_VIDEO_PATH = "output.mp4"
 CSV_PER_FRAME = "vehicle_speeds.csv"
 CSV_SUMMARY = "vehicle_speed_summary.csv"
+CSV_FRAME_METRICS = "frame_metrics.csv"
 
 CONFIDENCE_THRESHOLD = 0.3
 IOU_THRESHOLD = 0.5
@@ -80,8 +80,6 @@ class ViewTransformer:
         return transformed.reshape(-1, 2)
 
 
-
-
 def draw_semi_transparent_box(frame, x1, y1, x2, y2, color=(10, 10, 10), alpha=0.45):
     overlay = frame.copy()
     cv2.rectangle(overlay, (x1, y1), (x2, y2), color, -1)
@@ -133,7 +131,6 @@ def plot_traffic_data(csv_path):
     plt.show()
 
 
-
 # --- Main Logic ---
 if __name__ == '__main__':
     print("[INFO] Loading YOLO model...")
@@ -171,15 +168,31 @@ if __name__ == '__main__':
     track_first_frame    = {}
     track_last_frame     = {}
 
+    HISTORY_WINDOW_SEC = 10
+    PREDICTION_HORIZON_SEC = 5
+    global_density_history = deque(maxlen=int(video_info.fps * HISTORY_WINDOW_SEC))
+    global_risk_history = deque(maxlen=int(video_info.fps * HISTORY_WINDOW_SEC))
+
     lane_cross_banner_frames = 0
     frame_generator = sv.get_video_frames_generator(source_path=SOURCE_VIDEO_PATH)
 
     # Open CSVs and Video Sink
-    with open(CSV_PER_FRAME, "w", newline="") as f_frame, sv.VideoSink(TARGET_VIDEO_PATH, video_info) as sink:
+    with open(CSV_PER_FRAME, "w", newline="") as f_frame, \
+         open(CSV_FRAME_METRICS, "w", newline="") as f_metrics, \
+         sv.VideoSink(TARGET_VIDEO_PATH, video_info) as sink:
+        
         w_frame = csv.writer(f_frame)
         w_frame.writerow([
             "frame", "timestamp_sec", "track_id", "vehicle_class",
             "speed_kmh", "overspeed_flag", "lane_crossing_flag", "risk_score"
+        ])
+
+        w_metrics = csv.writer(f_metrics)
+        w_metrics.writerow([
+            "frame", "timestamp_sec", "live_vehicles", 
+            "pred_vehicles_5s",  
+            "overspeeding_vehicles", "lane_crossings", 
+            "speed_variation", "risk_score", "pred_risk_score_5s"
         ])
 
         for frame_idx, frame in tqdm(enumerate(frame_generator, start=1), total=video_info.total_frames):
@@ -266,8 +279,10 @@ if __name__ == '__main__':
             if len(detections) > 0:
                 detections.class_id = np.array(color_indices)
 
-            # 4. Risk & Congestion Calculation
+            # 4. Risk, Congestion & Trend Prediction Calculation
             active_tracks = len(detections)
+            global_density_history.append(active_tracks) # Store history
+            
             if active_tracks < CONGESTION_THRESHOLDS["low"]:
                 cong_str, c_val, cong_color = "Low",    1, COLOR_GREEN
             elif active_tracks < CONGESTION_THRESHOLDS["medium"]:
@@ -279,6 +294,57 @@ if __name__ == '__main__':
             risk_score = (RISK_WEIGHTS["alpha"] * active_tracks +
                           RISK_WEIGHTS["beta"]  * speed_var     +
                           RISK_WEIGHTS["gamma"] * c_val)
+
+            global_risk_history.append(risk_score)
+
+            # TREND PREDICTION LOGIC 
+            predicted_density = active_tracks  # Default fallback
+            pred_cong_str = cong_str
+            pred_cong_color = cong_color
+
+            # Only predict if we have at least 3 seconds of data to form a trend line
+            if len(global_density_history) > int(video_info.fps * 3):
+                y_data = list(global_density_history)
+                x_data = np.arange(len(y_data))
+                
+                # Fit a 1st-degree polynomial (Linear Regression: y = mx + c)
+                m, c = np.polyfit(x_data, y_data, 1)
+                
+                # Predict X frames into the future
+                future_x = len(y_data) + int(video_info.fps * PREDICTION_HORIZON_SEC)
+                predicted_density = int(m * future_x + c)
+                predicted_density = max(0, predicted_density) # Prevent negative predictions
+
+                # Classify future congestion
+                if predicted_density < CONGESTION_THRESHOLDS["low"]:
+                    pred_cong_str, pred_cong_color = "Low", COLOR_GREEN
+                elif predicted_density < CONGESTION_THRESHOLDS["medium"]:
+                    pred_cong_str, pred_cong_color = "Medium", (0, 165, 255)
+                else:
+                    pred_cong_str, pred_cong_color = "High", COLOR_RED
+                
+            predicted_risk = risk_score
+            risk_trend = "Stable"
+
+            if len(global_risk_history) > int(video_info.fps * 3):
+                y_risk = list(global_risk_history)
+                x_risk = np.arange(len(y_risk))
+                
+                # Fit a 1st-degree polynomial (y = mx + c) to historical risk
+                m_risk, c_risk = np.polyfit(x_risk, y_risk, 1)
+                
+                # Predict risk at future frame
+                future_frame = len(y_risk) + int(video_info.fps * PREDICTION_HORIZON_SEC)
+                predicted_risk = max(0, float(m_risk * future_frame + c_risk))
+
+                # Determine Trend
+                if predicted_risk > risk_score + 1.0:
+                    risk_trend = "Increasing"
+                elif predicted_risk < risk_score - 1.0:
+                    risk_trend = "Decreasing"
+                else:
+                    risk_trend = "Stable"
+
 
             # 5. Write per-frame CSV
             for i in range(len(detections)):
@@ -388,7 +454,7 @@ if __name__ == '__main__':
                             font, TEXT_SCALE, s_color, TEXT_THICKNESS, cv2.LINE_AA)
 
             # Stats HUD
-            draw_semi_transparent_box(annotated_frame, 0, 0, 310, 230)
+            draw_semi_transparent_box(annotated_frame, 0, 0, 310, 280) 
             cv2.putText(annotated_frame, "TRAFFIC MONITOR & RISK", (8, 20),
                         font, 0.48, (200, 200, 200), 1)
             cv2.line(annotated_frame, (8, 26), (302, 26), (100, 100, 100), 1)
@@ -401,21 +467,44 @@ if __name__ == '__main__':
 
             n_over = len(overspeeding_now)
             n_lane = len(lane_crossing_now)
+            
+            w_metrics.writerow([
+                frame_idx, 
+                round(ts, 3), 
+                active_tracks, 
+                predicted_density, 
+                n_over, 
+                n_lane, 
+                round(speed_var, 3), 
+                round(risk_score, 3),
+                round(predicted_risk, 3) 
+            ])
+
             cv2.putText(annotated_frame, f"Overspeeding : {n_over}",
                         (8, 135), font, 0.50, COLOR_RED if n_over > 0 else (180, 180, 180), 1)
             cv2.putText(annotated_frame, f"Lane Crosses : {n_lane}",
                         (8, 160), font, 0.50, COLOR_PURPLE if n_lane > 0 else (180, 180, 180), 1)
 
-            # Legend
-            cv2.circle(annotated_frame, (10,  200), 5, COLOR_GREEN,  -1)
-            cv2.putText(annotated_frame, "Norm", (18,  204), font, 0.38, COLOR_GREEN,  1)
-            cv2.circle(annotated_frame, (75,  200), 5, COLOR_RED,   -1)
-            cv2.putText(annotated_frame, "Spd",  (83,  204), font, 0.38, COLOR_RED,   1)
-            cv2.circle(annotated_frame, (130, 200), 5, COLOR_PURPLE, -1)
-            cv2.putText(annotated_frame, "Lane", (138, 204), font, 0.38, COLOR_PURPLE, 1)
+            # --- ADD PREDICTION DISPLAY ---
+            cv2.putText(annotated_frame, f"Pred Density : {predicted_density} (+{PREDICTION_HORIZON_SEC}s)",
+                        (8, 195), font, 0.50, (255, 255, 255), 1)
+            cv2.putText(annotated_frame, f"Pred Congest : {pred_cong_str}",
+                        (8, 220), font, 0.50, pred_cong_color, 1)
+            cv2.putText(annotated_frame, f"Risk Trend   : {risk_trend}",
+                        (8, 120), cv2.FONT_HERSHEY_DUPLEX, 0.50, (255, 255, 255), 1)
+            cv2.putText(annotated_frame, f"Pred Risk    : {predicted_risk:.1f}",
+                        (8, 245), font, 0.50, (0, 120, 255), 1)
 
-            # Adaptive Signal HUD (rendered below the stats box)
-            draw_signal_hud(annotated_frame, signal_status, x=0, y=235)
+            # Legend (Pushed down from Y=200 to Y=255)
+            cv2.circle(annotated_frame, (10,  255), 5, COLOR_GREEN,  -1)
+            cv2.putText(annotated_frame, "Norm", (18,  259), font, 0.38, COLOR_GREEN,  1)
+            cv2.circle(annotated_frame, (75,  255), 5, COLOR_RED,   -1)
+            cv2.putText(annotated_frame, "Spd",  (83,  259), font, 0.38, COLOR_RED,   1)
+            cv2.circle(annotated_frame, (130, 255), 5, COLOR_PURPLE, -1)
+            cv2.putText(annotated_frame, "Lane", (138, 259), font, 0.38, COLOR_PURPLE, 1)
+
+            # Adaptive Signal HUD (Pushed down from Y=235 to Y=285)
+            draw_signal_hud(annotated_frame, signal_status, x=0, y=285)
 
             # Warning banners
             vw, vh = video_info.resolution_wh
